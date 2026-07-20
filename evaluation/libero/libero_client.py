@@ -267,7 +267,7 @@ class LocalClient:
         # Proprioception
         proprio = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             actions = self.model.generate_actions(
                 input_ids=lang["input_ids"],
                 image_input=images,
@@ -860,13 +860,43 @@ def main():
 
     args = parser.parse_args()
 
-    # ── CUDA determinism (must be set BEFORE any torch import) ──
+    # ── CUDA / PyTorch determinism (set BEFORE any torch model load) ──
+    # Reference: https://pytorch.org/docs/stable/notes/randomness.html
     import os as _os
     _os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    _os.environ.setdefault("PYTHONHASHSEED", str(args.seed))
+    # Disable parallel native compilation which can introduce non-determinism
+    _os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
     try:
         import torch as _torch
+
+        # --- random seeds for PyTorch & CUDA ---
+        _torch.manual_seed(args.seed)
+        if _torch.cuda.is_available():
+            _torch.cuda.manual_seed(args.seed)
+            _torch.cuda.manual_seed_all(args.seed)
+
+        # --- cuDNN ---
         _torch.backends.cudnn.deterministic = True
         _torch.backends.cudnn.benchmark = False
+
+        # --- TF32: disable to avoid reduced-precision non-determinism ---
+        if hasattr(_torch.backends.cuda.matmul, "allow_tf32"):
+            _torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(_torch.backends.cudnn, "allow_tf32"):
+            _torch.backends.cudnn.allow_tf32 = False
+
+        # --- scaled_dot_product_attention: disable flash / mem-efficient,
+        #     use deterministic math implementation instead ---
+        if hasattr(_torch.backends.cuda, "enable_flash_sdp"):
+            _torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(_torch.backends.cuda, "enable_mem_efficient_sdp"):
+            _torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(_torch.backends.cuda, "enable_math_sdp"):
+            _torch.backends.cuda.enable_math_sdp(True)
+
+        # --- global determinism flag (warn_only=True to avoid hard errors
+        #     on ops without deterministic CUDA kernels) ---
         if hasattr(_torch, "use_deterministic_algorithms"):
             _torch.use_deterministic_algorithms(True, warn_only=True)
     except Exception:
